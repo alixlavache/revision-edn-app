@@ -46,7 +46,7 @@ if api_key:
                     try:
                         contexte = f"Tu es un tuteur pour les EDN. Base-toi STRICTEMENT sur ce cours :\n\n{st.session_state.pdf_text}"
                         response = client.models.generate_content(
-                            model='gemini-1.5-pro',
+                            model='gemini-3.8-flash',
                             contents=[contexte, prompt]
                         )
                         st.write(response.text)
