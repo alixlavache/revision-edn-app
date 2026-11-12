@@ -1,7 +1,10 @@
 import streamlit as st
 import PyPDF2
-from google import genai
-from google.genai import types
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain.vectorstores import FAISS
+from langchain.prompts import PromptTemplate
+from langchain.chains.question_answering import load_qa_chain
 
 st.set_page_config(page_title="Révision EDN", layout="wide")
 st.title("Assistant de Révision EDN")
@@ -12,22 +15,55 @@ with st.sidebar:
     api_key = st.text_input("Clé API Gemini", type="password")
     uploaded_file = st.file_uploader("Uploader un PDF (Cours)", type="pdf")
 
+# --- FONCTIONS RAG ---
+def get_pdf_text(pdf_file):
+    text = ""
+    reader = PyPDF2.PdfReader(pdf_file)
+    for page in reader.pages:
+        text += page.extract_text()
+    return text
+
+def get_text_chunks(text):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.split_text(text)
+    return chunks
+
+def get_vector_store(chunks, api_key):
+    # Utilise le modèle d'embedding gratuit de Google
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=api_key)
+    vector_store = FAISS.from_texts(chunks, embedding=embeddings)
+    return vector_store
+
+def get_conversational_chain(api_key):
+    prompt_template = """
+    Tu es un tuteur médical pour un étudiant préparant les EDN.
+    Réponds de manière détaillée en te basant STRICTEMENT sur le contexte fourni (qui est un extrait du cours).
+    Si la réponse n'est pas dans le contexte, dis simplement "Je ne trouve pas cette information dans le cours fourni".\n\n
+    Contexte:\n {context}?\n
+    Question: \n{question}\n
+    Réponse:
+    """
+    model = ChatGoogleGenerativeAI(model="gemini-3.8-flash", google_api_key=api_key, temperature=0.1)
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
+    return chain
+
 # --- LOGIQUE PRINCIPALE ---
 if api_key:
-    client = genai.Client(api_key=api_key, http_options={'api_version': 'v1beta'})
-
-    # 1. Extraction du PDF
+    # 1. Traitement du PDF
     if uploaded_file:
         if "last_file" not in st.session_state or st.session_state.last_file != uploaded_file.name:
-            with st.spinner("Extraction du texte en cours..."):
+            with st.spinner("Analyse du document et création de l'index (cela peut prendre un moment pour 400 pages)..."):
                 try:
-                    reader = PyPDF2.PdfReader(uploaded_file)
-                    texte_extrait = "".join(page.extract_text() + "\n" for page in reader.pages)
+                    raw_text = get_pdf_text(uploaded_file)
+                    text_chunks = get_text_chunks(raw_text)
                     
-                    st.session_state.pdf_text = texte_extrait
+                    vector_store = get_vector_store(text_chunks, api_key)
+                    st.session_state.vector_store = vector_store
+                    
                     st.session_state.last_file = uploaded_file.name
-                    st.session_state.messages = [] # Réinitialise le chat pour le nouveau cours
-                    st.success("Cours chargé avec succès !")
+                    st.session_state.messages = [] # Réinitialise le chat
+                    st.success("Cours indexé avec succès ! Posez votre question.")
                 except Exception as e:
                     st.error(f"Erreur lors de la lecture du PDF : {e}")
 
@@ -35,40 +71,28 @@ if api_key:
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Affichage de l'historique
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
 
-    # Champ de saisie
     if prompt := st.chat_input("Pose une question sur ce cours..."):
-        if "pdf_text" not in st.session_state:
-            st.warning("Veuillez d'abord uploader un cours dans la barre latérale.")
+        if "vector_store" not in st.session_state:
+            st.warning("Veuillez d'abord uploader un cours.")
         else:
-            # Afficher la question de l'utilisateur
+            st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
                 st.write(prompt)
-            st.session_state.messages.append({"role": "user", "content": prompt})
 
-            # Interroger Gemini
             with st.chat_message("assistant"):
                 try:
-                    contexte_medical = (
-                        "Tu es un tuteur pour un étudiant en médecine préparant les EDN. "
-                        "Réponds STRICTEMENT en te basant sur le cours fourni. "
-                        f"\n\nCOURS :\n{st.session_state.pdf_text}"
-                    )
-                    
-                    reponse = client.models.generate_content(
-                        model='gemini-3.8-flash',
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            system_instruction=contexte_medical,
-                            temperature=0.1
-                        )
-                    )
-                    st.write(reponse.text)
-                    st.session_state.messages.append({"role": "assistant", "content": reponse.text})
+                    with st.spinner("Recherche des pages pertinentes..."):
+                        # On ne cherche que les 4 morceaux les plus pertinents
+                        docs = st.session_state.vector_store.similarity_search(prompt, k=4)
+                        chain = get_conversational_chain(api_key)
+                        response = chain({"input_documents": docs, "question": prompt}, return_only_outputs=True)
+                        
+                        st.write(response["output_text"])
+                        st.session_state.messages.append({"role": "assistant", "content": response["output_text"]})
                 except Exception as e:
                     st.error(f"Erreur API : {e}")
 else:
