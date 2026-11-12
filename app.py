@@ -14,7 +14,7 @@ with st.sidebar:
 
 # --- LOGIQUE PRINCIPALE ---
 if api_key:
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key, http_options={'api_version': 'v1beta'})
 
     # 1. Extraction du PDF
     if uploaded_file:
